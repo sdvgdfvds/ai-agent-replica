@@ -1,0 +1,681 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  applyGuardError,
+  claimTurnSettledRefresh,
+  createConversationDraftController,
+  isContentlessRunChat,
+  isSessionControlPackage,
+  planEmptyStreamClose,
+  planFollowIdleReplay,
+  planObservationClose,
+  planRootResultLoading,
+  resolveLatestContextUsage,
+  resolveRunReplayState,
+} from "./useConversationStream";
+import {
+  planBackgroundCardRefresh,
+  resolveActionPanelVisibility,
+} from "./streamState";
+import { parseAgentAnswer } from "@/utils/sseParsers";
+
+describe("useConversationStream helpers", () => {
+  it("同一 requestId 的 finished 只认领一次刷新", () => {
+    const settled = new Set<string>();
+
+    expect(claimTurnSettledRefresh("req-1", settled)).toBe(true);
+    expect(claimTurnSettledRefresh("req-1", settled)).toBe(false);
+    expect(claimTurnSettledRefresh("", settled)).toBe(false);
+  });
+
+  it("空壳 chat 判定为可全量重放，带内容的 chat 不重放", () => {
+    // 历史 hydrate 的 summary 壳：全部内容字段为空。
+    const shell = {
+      requestId: "req-1",
+      response: "",
+      conclusion: undefined,
+      multiAgent: { tasks: [] },
+      timeline: [],
+    } as unknown as CHAT.ChatItem;
+    expect(isContentlessRunChat(shell)).toBe(true);
+    expect(isContentlessRunChat(undefined)).toBe(true);
+
+    // 账本回放灌过工具卡 / 有结论 / 有计划 → 不允许再全量重放（会重复挂卡）。
+    const withCards = {
+      ...shell,
+      multiAgent: { tasks: [[{ messageType: "tool_call" }]] },
+    } as unknown as CHAT.ChatItem;
+    expect(isContentlessRunChat(withCards)).toBe(false);
+
+    const withConclusion = {
+      ...shell,
+      conclusion: { result: "x" }
+    } as unknown as CHAT.ChatItem;
+    expect(isContentlessRunChat(withConclusion)).toBe(false);
+
+    const withPlan = {
+      ...shell,
+      multiAgent: {
+        tasks: [],
+        plan: { title: "p" }
+      },
+    } as unknown as CHAT.ChatItem;
+    expect(isContentlessRunChat(withPlan)).toBe(false);
+
+    const withTimeline = {
+      ...shell,
+      timeline: [{}]
+    } as unknown as CHAT.ChatItem;
+    expect(isContentlessRunChat(withTimeline)).toBe(false);
+  });
+
+  it("会话级控制帧不依赖 requestId 路由", () => {
+    expect(isSessionControlPackage("heartbeat")).toBe(true);
+    expect(isSessionControlPackage("follow_pending")).toBe(true);
+    expect(isSessionControlPackage("follow_idle")).toBe(true);
+    expect(isSessionControlPackage("result")).toBe(false);
+  });
+
+  it("新任务沿用上一轮最近的真实上下文快照", () => {
+    const usage = {
+      max: 200000,
+      promptTokens: 24000,
+    };
+    const result = resolveLatestContextUsage([
+      { contextUsage: usage } as CHAT.ChatItem,
+      {} as CHAT.ChatItem,
+      { contextUsage: { max: 200000 } } as CHAT.ChatItem,
+    ]);
+
+    expect(result).toEqual(usage);
+    expect(result).not.toBe(usage);
+  });
+
+  it("没有真实 prompt_tokens 时不生成上下文快照", () => {
+    expect(
+      resolveLatestContextUsage([
+        { contextUsage: { max: 200000 } } as CHAT.ChatItem,
+      ])
+    ).toBeUndefined();
+  });
+
+  it("guard error 应将当前 chat 标记为 FAILED 并生成 conclusion", () => {
+    const currentChat = {
+      requestId: "req-1",
+      loading: true,
+      multiAgent: { tasks: [] },
+      metrics: {},
+    } as unknown as CHAT.ChatItem;
+
+    const next = applyGuardError(currentChat, "当前请求处理失败，请稍后重试");
+
+    expect(next.loading).toBe(false);
+    expect(next.metrics?.status).toBe("FAILED");
+    expect(next.conclusion?.messageType).toBe("task_summary");
+  });
+
+  it("存在 plan 但没有产物 task 时不自动打开右侧工作区", () => {
+    expect(
+      resolveActionPanelVisibility({
+        plan: {
+          stages: [{
+            title: "分析需求",
+            status: "completed"
+          }],
+        } as unknown as CHAT.Plan,
+        taskList: [],
+      })
+    ).toBe(false);
+  });
+
+  it("heartbeat 包在缺少 resultMap 时也应被正常解析", () => {
+    const result = parseAgentAnswer({
+      status: "success",
+      packageType: "heartbeat",
+      finished: false,
+      response: "",
+      responseAll: "",
+      useTimes: 0,
+      useTokens: 0,
+      responseType: "text",
+      encrypted: false,
+      errorMsg: "",
+    });
+
+    expect(result.packageType).toBe("heartbeat");
+    expect(result.resultMap).toEqual({});
+  });
+
+  it("result 包的 errorMsg 为 null 时也应被正常解析", () => {
+    const result = parseAgentAnswer({
+      status: "running",
+      packageType: "result",
+      finished: false,
+      response: "",
+      responseAll: "",
+      useTimes: 0,
+      useTokens: 0,
+      responseType: "text",
+      encrypted: false,
+      errorMsg: null,
+      resultMap: {
+        eventData: {
+          messageOrder: 1,
+          messageType: "task",
+          messageId: "msg-1",
+          taskId: "task-1",
+          taskOrder: 1,
+          resultMap: {
+            messageType: "agent_stream",
+            result: "正在处理",
+          },
+        },
+      },
+    });
+
+    expect(result.errorMsg).toBe("");
+    expect(result.resultMap.eventData).toBeDefined();
+  });
+
+  it("旧 turn 的 replace 不得覆盖后追加的新消息", () => {
+    let latest: CHAT.ConversationHistory = {
+      id: "c1",
+      sessionId: "s1",
+      chatList: [
+        {
+          requestId: "req-old",
+          query: "先跑后台"
+        } as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+    const controller = createConversationDraftController<CHAT.ChatItem>(
+      "c1",
+      latest,
+      "chatList",
+      (_id, next) => {
+        latest = next;
+      },
+      () => latest
+    );
+
+    latest = {
+      ...latest,
+      chatList: [
+        latest.chatList[0],
+        {
+          requestId: "req-new",
+          query: "第二句"
+        } as CHAT.ChatItem,
+      ],
+    };
+
+    const next = controller.replaceLastItem({
+      requestId: "req-old",
+      query: "先跑后台",
+      conclusion: { messageType: "result" },
+    } as CHAT.ChatItem);
+
+    expect(next.chatList.map((item) => item.requestId)).toEqual([
+      "req-old",
+      "req-new",
+    ]);
+    expect(next.chatList[0].conclusion?.messageType).toBe("result");
+    expect(next.chatList[1].query).toBe("第二句");
+  });
+
+  it("replace 同一 requestId 不得追加出重复 turn", () => {
+    let latest: CHAT.ConversationHistory = {
+      id: "c1",
+      sessionId: "s1",
+      chatList: [
+        {
+          requestId: "req-old",
+          query: "先跑后台"
+        } as CHAT.ChatItem,
+        {
+          requestId: "req-old",
+          query: "重复副本"
+        } as CHAT.ChatItem,
+        {
+          requestId: "req-new",
+          query: "第二句"
+        } as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+    const controller = createConversationDraftController<CHAT.ChatItem>(
+      "c1",
+      latest,
+      "chatList",
+      (_id, next) => {
+        latest = next;
+      },
+      () => latest
+    );
+
+    const next = controller.replaceLastItem({
+      requestId: "req-old",
+      query: "先跑后台",
+      conclusion: { messageType: "result" },
+    } as CHAT.ChatItem);
+
+    expect(next.chatList.map((item) => item.requestId)).toEqual([
+      "req-old",
+      "req-new",
+    ]);
+  });
+
+  it("续跑首帧可按 Run A requestId 替换，并让后续事件按 Run B requestId 更新", () => {
+    let latest: CHAT.ConversationHistory = {
+      id: "c1",
+      sessionId: "s1",
+      chatList: [
+        {
+          requestId: "run-a",
+          query: "需要确认",
+          loading: false,
+          metrics: { status: "WAITING_INPUT" },
+        } as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+    const controller = createConversationDraftController<CHAT.ChatItem>(
+      "c1",
+      latest,
+      "chatList",
+      (_id, next) => {
+        latest = next;
+      },
+      () => latest
+    );
+
+    const resumed = controller.replaceItem(
+      {
+        requestId: "resume-b",
+        query: "需要确认",
+        loading: true,
+        tip: "正在推进任务…",
+        metrics: { status: "RUNNING" },
+      } as CHAT.ChatItem,
+      "run-a"
+    );
+    controller.commit(resumed);
+
+    expect(latest.chatList.map((item) => item.requestId)).toEqual(["resume-b"]);
+    expect(latest.chatList[0].metrics?.status).toBe("RUNNING");
+
+    const next = controller.replaceLastItem({
+      requestId: "resume-b",
+      query: "需要确认",
+      loading: false,
+      conclusion: {
+        messageType: "result",
+        result: "已完成",
+      },
+      metrics: { status: "SUCCESS" },
+    } as CHAT.ChatItem);
+
+    expect(next.chatList).toHaveLength(1);
+    expect(next.chatList[0].requestId).toBe("resume-b");
+    expect(next.chatList[0].conclusion?.result).toBe("已完成");
+  });
+
+  it("Run B replay 会恢复 context_usage、工具过程和最终结果", () => {
+    const event = (
+      messageId: string,
+      resultMap: Record<string, unknown>,
+      finished = false
+    ): MESSAGE.EventData => ({
+      messageType: "task",
+      taskId: "task-1",
+      taskOrder: 1,
+      messageOrder: 1,
+      messageId,
+      resultMap: resultMap as unknown as MESSAGE.Task,
+      finish: finished,
+      isFinal: finished,
+    } as unknown as MESSAGE.EventData);
+    const frame = (eventData: MESSAGE.EventData, finished = false) => ({
+      reqId: "resume-b",
+      status: "success",
+      finished,
+      resultMap: { eventData },
+    });
+    const conversation = {
+      id: "c1",
+      sessionId: "s1",
+      deepThink: false,
+      chatList: [
+        {
+          sessionId: "s1",
+          requestId: "resume-b",
+          query: "需要确认",
+          loading: true,
+          multiAgent: { tasks: [] },
+          metrics: { status: "RUNNING" },
+        } as unknown as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+
+    const { chat, status } = resolveRunReplayState(conversation, {
+      requestId: "resume-b",
+      status: "SUCCESS",
+      queryText: "需要确认",
+      replayFrames: [
+        frame(
+          event("context-1", {
+            messageType: "context_usage",
+            max: 200000,
+            promptTokens: 1234,
+          })
+        ),
+        frame(
+          event("thought-1", {
+            messageType: "tool_thought",
+            toolThought: "先读取资料",
+          })
+        ),
+        frame(
+          event("reasoning-1", {
+            messageType: "llm_reasoning",
+            reasoningContent: "正在判断下一步",
+          })
+        ),
+        frame(
+          event("call-1", {
+            messageType: "tool_call",
+            toolName: "read_file",
+            toolCallId: "call-1",
+            status: "running",
+          })
+        ),
+        frame(
+          event("result-1", {
+            messageType: "tool_result",
+            toolName: "read_file",
+            toolCallId: "call-1",
+            status: "success",
+            toolResult: {
+              toolName: "read_file",
+              toolResult: "已读取",
+            },
+          })
+        ),
+        frame(
+          event("answer-1", {
+            messageType: "result",
+            result: "已完成",
+            taskSummary: "已完成",
+            isFinal: true,
+          }, true),
+          true
+        ),
+      ],
+    });
+
+    expect(status).toBe("SUCCESS");
+    expect(chat?.requestId).toBe("resume-b");
+    expect(chat?.loading).toBe(false);
+    expect(chat?.contextUsage).toEqual({
+      max: 200000,
+      promptTokens: 1234,
+    });
+    expect(chat?.conclusion?.result).toBe("已完成");
+    expect(
+      chat?.multiAgent.tasks.flat().map((task) => task.messageType)
+    ).toEqual(
+      expect.arrayContaining([
+        "tool_thought",
+        "llm_reasoning",
+        "tool_result",
+        "result",
+      ])
+    );
+    expect(chat?.tip).not.toBe("需要你的帮助");
+  });
+
+  it("SUCCESS replay 会清除 HITL 等待状态", () => {
+    const conversation = {
+      id: "c1",
+      sessionId: "s1",
+      chatList: [
+        {
+          sessionId: "s1",
+          requestId: "resume-b",
+          query: "需要确认",
+          loading: true,
+          tip: "需要你的帮助",
+          multiAgent: { tasks: [] },
+          metrics: { status: "RUNNING" },
+        } as unknown as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+
+    const { chat, status } = resolveRunReplayState(conversation, {
+      requestId: "resume-b",
+      status: "SUCCESS",
+      queryText: "需要确认",
+      finalSummaryText: "完成",
+      replayFrames: [],
+    });
+
+    expect(status).toBe("SUCCESS");
+    expect(chat?.loading).toBe(false);
+    expect(chat?.metrics?.status).toBe("SUCCESS");
+    expect(chat?.tip).not.toBe("需要你的帮助");
+  });
+
+  it("released 或已经看到 follow_idle 时不写断开文案、不重连", () => {
+    expect(
+      planObservationClose({
+        released: true,
+        sawFollowIdle: false,
+        chatRunning: true,
+      })
+    ).toEqual({
+      writeDisconnectHint: false,
+      reconnect: false
+    });
+    expect(
+      planObservationClose({
+        released: false,
+        sawFollowIdle: true,
+        chatRunning: true,
+      })
+    ).toEqual({
+      writeDisconnectHint: false,
+      reconnect: false
+    });
+  });
+
+  it("没看到 follow_idle、仍在跑、且不是 released 时才写文案并重连", () => {
+    expect(
+      planObservationClose({
+        released: false,
+        sawFollowIdle: false,
+        chatRunning: true,
+      })
+    ).toEqual({
+      writeDisconnectHint: true,
+      reconnect: true
+    });
+    expect(
+      planObservationClose({
+        released: false,
+        sawFollowIdle: false,
+        chatRunning: false,
+      })
+    ).toEqual({
+      writeDisconnectHint: false,
+      reconnect: false
+    });
+  });
+
+  it("follow_idle 只有明确终态才停止，账本仍为 RUNNING 时继续重连", () => {
+    expect(planFollowIdleReplay("SUCCESS")).toBe("stop");
+    expect(planFollowIdleReplay("FAILED")).toBe("stop");
+    expect(planFollowIdleReplay("STOPPED")).toBe("stop");
+    expect(planFollowIdleReplay("TIMEOUT")).toBe("stop");
+    expect(planFollowIdleReplay("WAITING_INPUT")).toBe("stop");
+    expect(planFollowIdleReplay("RUNNING")).toBe("reconnect");
+    expect(planFollowIdleReplay("UNKNOWN")).toBe("reconnect");
+  });
+
+  it("空流断开走账本回放收口，收到过帧才允许续绑重连", () => {
+    // 回归：后端已无投影时前端曾按退避无限重挂，且永不回查账本，
+    // 导致 AskUserQuestion 回答后 UI 永久停在「工作中」。
+    expect(planEmptyStreamClose({ sawAnyFrame: false })).toBe("replay");
+    expect(planEmptyStreamClose({ sawAnyFrame: true })).toBe("reconnect");
+  });
+
+  it("根 result 到达即收口 loading，finished 未到（后台子 Agent 在飞）是 settle", () => {
+    // 回归：主 Agent 派发 run_in_background 子 Agent 后，后端会推迟 finished
+    // （defer projection complete: background tasks still running），实测 6 分钟后
+    // 才发 stream_settle。resume 链路此前只写 conclusion 不收口 loading，
+    // 导致 UI 一直「工作中 X 秒」+ 转圈。
+    expect(
+      planRootResultLoading({
+        isRootResult: true,
+        finished: false,
+      })
+    ).toBe("settle");
+    // 终答 + finished 同帧到达：交给 finished 分支统一收口，不能重复 settle。
+    expect(
+      planRootResultLoading({
+        isRootResult: true,
+        finished: true,
+      })
+    ).toBe("keep");
+    // 子 Agent result 带 parentToolUseId，不能覆盖主对话终答。
+    expect(
+      planRootResultLoading({
+        isRootResult: false,
+        finished: false,
+      })
+    ).toBe("keep");
+    expect(
+      planRootResultLoading({
+        isRootResult: false,
+        finished: true,
+      })
+    ).toBe("keep");
+  });
+
+  it("后台父卡刷新：流在飞不轮询，收口后有 running 后台卡才轮询", () => {
+    // 对齐 ZCode「账本权威、流可断」：父流 root result 即关，后台终态只落账本，
+    // 前端用有界轮询 replay 把父卡刷到终态（useConversationStream 的 effect 消费本决策）。
+    const runningChat = {
+      requestId: "req-bg",
+      multiAgent: {
+        tasks: [
+          [
+            {
+              messageType: "tool_result",
+              resultMap: {
+                run_in_background: true,
+                status: "running",
+                toolResult: '{"status":"running"}',
+              },
+            } as unknown as CHAT.Task,
+          ],
+        ],
+      },
+      metrics: { status: "SUCCESS" },
+    } as unknown as CHAT.ChatItem;
+
+    const settledChat = {
+      ...runningChat,
+      multiAgent: {
+        tasks: [
+          [
+            {
+              messageType: "tool_result",
+              resultMap: {
+                run_in_background: true,
+                status: "success",
+                toolResult: '{"status":"success"}',
+              },
+            } as unknown as CHAT.Task,
+          ],
+        ],
+      },
+    } as unknown as CHAT.ChatItem;
+
+    const waitingChat = {
+      ...runningChat,
+      metrics: { status: "WAITING_INPUT" },
+    } as unknown as CHAT.ChatItem;
+
+    const noTaskChat = { multiAgent: { tasks: [] } } as unknown as CHAT.ChatItem;
+
+    // 流还在（loading）：等 root result 收口，不轮询
+    expect(
+      planBackgroundCardRefresh({
+        loading: true,
+        chat: runningChat,
+      })
+    ).toBe("idle");
+    // 收口 + running 后台卡：轮询 replay
+    expect(
+      planBackgroundCardRefresh({
+        loading: false,
+        chat: runningChat,
+      })
+    ).toBe("poll");
+    // 后台卡已终态：停止
+    expect(
+      planBackgroundCardRefresh({
+        loading: false,
+        chat: settledChat,
+      })
+    ).toBe("idle");
+    // HITL 停驻不轮询
+    expect(
+      planBackgroundCardRefresh({
+        loading: false,
+        chat: waitingChat,
+      })
+    ).toBe("idle");
+    // 无 requestId / 无后台卡：不动
+    expect(
+      planBackgroundCardRefresh({
+        loading: false,
+        chat: null,
+      })
+    ).toBe("idle");
+    expect(
+      planBackgroundCardRefresh({
+        loading: false,
+        chat: noTaskChat,
+      })
+    ).toBe("idle");
+  });
+
+  it("空流收口后账本 SUCCESS 会把 loading 归位", () => {
+    const conversation = {
+      id: "c1",
+      sessionId: "s1",
+      chatList: [
+        {
+          sessionId: "s1",
+          requestId: "resume-b",
+          query: "需要确认",
+          loading: true,
+          multiAgent: { tasks: [] },
+          metrics: { status: "RUNNING" },
+        } as unknown as CHAT.ChatItem,
+      ],
+    } as CHAT.ConversationHistory;
+
+    const { chat, status } = resolveRunReplayState(conversation, {
+      requestId: "resume-b",
+      status: "SUCCESS",
+      queryText: "需要确认",
+      finalSummaryText: "完成",
+      replayFrames: [],
+    });
+
+    expect(planEmptyStreamClose({ sawAnyFrame: false })).toBe("replay");
+    expect(planFollowIdleReplay(status)).toBe("stop");
+    expect(chat?.loading).toBe(false);
+    expect(chat?.metrics?.status).toBe("SUCCESS");
+  });
+});

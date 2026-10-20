@@ -1,0 +1,1160 @@
+import { buildAction } from "@/utils/chat";
+import {
+  formatSubAgentDuration,
+  isSubAgentParentTask,
+  resolveSubAgentDisplay,
+} from "@/utils/chat/subagent";
+import { isTimelineToolActive } from "@/components/ChatView/streamState";
+import { isFileListOnlyTask } from "@/utils/taskArtifacts";
+
+export type ProcessStepKind =
+  | "thinking"
+  | "assistant_reply"
+  | "read"
+  | "edit"
+  | "terminal"
+  | "search"
+  | "browser"
+  | "code"
+  | "file"
+  | "agent"
+  | "interactive"
+  | "user_message"
+  | "tool"
+  | "artifact";
+
+export type ProcessStepRow = {
+  id: string;
+  kind: ProcessStepKind;
+  title: string;
+  detail?: string;
+  expandable: boolean;
+  active: boolean;
+  completed: boolean;
+  durationMs?: number;
+  durationLabel?: string;
+  tool: CHAT.Task;
+  startedAtMs?: number;
+};
+
+export type ProcessStepGroup = {
+  id: string;
+  title: string;
+  taskLabel?: string;
+  digitalEmployee?: string;
+  stepCount: number;
+  active: boolean;
+  completed: boolean;
+  /** 可折叠；user_brief 分隔出的工作段为 true */
+  collapsible: boolean;
+  durationMs?: number;
+  durationLabel?: string;
+  steps: ProcessStepRow[];
+  /** PlanSolve 容器原始 task，用于折叠标题 */
+  container?: CHAT.Task;
+};
+
+export type ProcessThoughtBlock = {
+  text: string;
+  streaming: boolean;
+  durationMs?: number;
+  durationLabel?: string;
+  versionLabel?: string;
+  versionIndex: number;
+  versionTotal: number;
+};
+
+/**
+ * 时间线分段（对齐截图）：
+ * 深度思考(折叠) → 助手过程回复(常显) → 执行了 N 步(折叠组) → …
+ */
+export type ProcessSegment =
+  | { type: "group"; group: ProcessStepGroup }
+  | { type: "thinking"; step: ProcessStepRow }
+  | { type: "assistant_reply"; step: ProcessStepRow; text: string }
+  | { type: "user_message"; step: ProcessStepRow }
+  | { type: "final_reply"; step: ProcessStepRow; text: string };
+
+export type AgentProcessModel = {
+  hasProcess: boolean;
+  loading: boolean;
+  thought?: ProcessThoughtBlock;
+  /** 短意图句：思考首行或 tip，不重复 thought 全文 */
+  intentLine?: string;
+  /** 有序分段（主渲染源） */
+  segments: ProcessSegment[];
+  /** 兼容：仅 collapsible 工作组 */
+  groups: ProcessStepGroup[];
+  /** 末轮无 tool 的思考，作为最终回复（不进折叠组） */
+  finalReply?: { text: string; step: ProcessStepRow };
+  totalStepCount: number;
+  totalDurationMs?: number;
+  totalDurationLabel?: string;
+};
+
+function asText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function resolveToolName(tool: CHAT.Task): string {
+  return asText(
+    tool.toolResult?.toolName ||
+      (tool.resultMap as Record<string, unknown> | undefined)?.toolName
+  ).toLowerCase();
+}
+
+/** SendUserMessage / Brief 主可见输出，永不进折叠组，并作为步骤组分界 */
+export function isUserBriefTask(tool?: CHAT.Task): boolean {
+  if (!tool) {
+    return false;
+  }
+  if (tool.messageType === "user_brief") {
+    return true;
+  }
+  const toolName = resolveToolName(tool);
+  return (
+    toolName === "sendusermessage" ||
+    toolName === "brief" ||
+    toolName === "send_user_message"
+  );
+}
+
+export function resolveUserBriefText(tool: CHAT.Task): string {
+  const resultMap = (tool.resultMap || {}) as Record<string, unknown>;
+  const nested = (resultMap.resultMap || {}) as Record<string, unknown>;
+  const toolAny = tool as unknown as Record<string, unknown>;
+  return asText(
+    nested.message || resultMap.message || toolAny.message || tool.toolThought
+  );
+}
+
+/** 仅原生 CoT / plan 思考 → 深度思考（tool_thought 永不当思考） */
+function isNativeReasoningTask(tool: CHAT.Task): boolean {
+  return (
+    tool.messageType === "llm_reasoning" || tool.messageType === "plan_thought"
+  );
+}
+
+/**
+ * 助手过程回复：有 tool 时的 content（tool_thought）与正文流行模型的中间轮（agent_stream）。
+ * 常显切分点；不是思考 —— 它必须夹在两组工具卡片之间，而不是堆在对话最下方。
+ */
+function isAssistantProcessReplyTask(tool: CHAT.Task): boolean {
+  return tool.messageType === "tool_thought" || tool.messageType === "agent_stream";
+}
+
+/** 是否计入「执行了 N 个步骤」：思考/过程回复/user_brief 不计入 */
+function countsAsExecutableStep(tool: CHAT.Task): boolean {
+  if (
+    isUserBriefTask(tool) ||
+    isNativeReasoningTask(tool) ||
+    isAssistantProcessReplyTask(tool)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 助手过程回复正文。tool_thought 读 toolThought；agent_stream 读 result。
+ * 行模型下同一时刻只会有一种形态，取到即可。
+ */
+export function resolveAssistantReplyText(tool: CHAT.Task): string {
+  return asText(tool.toolThought || tool.result);
+}
+
+export function parseMessageTimeMs(value?: unknown): number | undefined {
+  if (value == null || value === "") {
+    return undefined;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      return undefined;
+    }
+    return value < 1e12 ? value * 1000 : value;
+  }
+
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    // 兼容秒级时间戳
+    return numeric < 1e12 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function formatProcessDuration(ms?: number): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) {
+    return "";
+  }
+  if (ms < 100) {
+    return "0.1s";
+  }
+  if (ms < 1000) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+  if (ms < 60_000) {
+    const seconds = ms / 1000;
+    return Number.isInteger(seconds) || seconds >= 10
+      ? `${Math.round(seconds)}s`
+      : `${seconds.toFixed(1)}s`;
+  }
+  return formatSubAgentDuration(ms) || `${Math.round(ms / 1000)}s`;
+}
+
+function isStepCompleted(tool: CHAT.Task): boolean {
+  return Boolean(tool.finish || tool.isFinal || tool.resultMap?.isFinal);
+}
+
+function resolveStepId(tool: CHAT.Task, index: number): string {
+  return (
+    tool.id ||
+    tool.messageId ||
+    resolveToolCallId(tool) ||
+    `${tool.messageType || "step"}-${tool.taskId || index}`
+  );
+}
+
+function resolveToolCallId(tool: CHAT.Task): string {
+  const resultMap = (tool.resultMap || {}) as Record<string, unknown>;
+  const nested = (resultMap.resultMap || {}) as Record<string, unknown>;
+  return asText(
+    resultMap.toolCallId ||
+      nested.toolCallId ||
+      tool.toolResult?.toolName
+  );
+}
+
+export function resolveProcessStepKind(tool: CHAT.Task): ProcessStepKind {
+  const messageType = tool.messageType || "";
+  if (messageType === "llm_reasoning" || messageType === "plan_thought") {
+    return "thinking";
+  }
+  // agent_stream 是 react 主 agent 的正文流行模型：中间轮（moreRounds=true）是助手过程回复；
+  // 终轮由结论区承接（handleAgentStreamMessage 只会把中间轮封口进时间线），这里统一按
+  // assistant_reply 渲染，保证它插在工具卡片之间而不是沉到对话底部。
+  if (messageType === "tool_thought" || messageType === "agent_stream") {
+    return "assistant_reply";
+  }
+  if (isUserBriefTask(tool)) {
+    return "user_message";
+  }
+  if (
+    messageType === "ask_user_question" ||
+    messageType === "desktop_control" ||
+    messageType === "plan_approval" ||
+    messageType === "session_tasks"
+  ) {
+    return "interactive";
+  }
+  if (isSubAgentParentTask(tool)) {
+    return "agent";
+  }
+  if (messageType === "browser") {
+    return "browser";
+  }
+  if (messageType === "deep_search" || messageType === "knowledge") {
+    return "search";
+  }
+  if (messageType === "code" || messageType === "html") {
+    return "code";
+  }
+  if (
+    messageType === "file" ||
+    messageType === "markdown" ||
+    messageType === "ppt" ||
+    messageType === "data_analysis" ||
+    messageType === "ui_tree" ||
+    messageType === "ui_patch"
+  ) {
+    return messageType === "file" ? "file" : "artifact";
+  }
+
+  const toolName = resolveToolName(tool);
+  if (
+    toolName.includes("read") ||
+    toolName.includes("cat") ||
+    toolName.includes("view") ||
+    toolName.includes("open")
+  ) {
+    return "read";
+  }
+  if (
+    toolName.includes("edit") ||
+    toolName.includes("write") ||
+    toolName.includes("create") ||
+    toolName.includes("patch") ||
+    toolName.includes("replace")
+  ) {
+    return "edit";
+  }
+  if (
+    toolName.includes("bash") ||
+    toolName.includes("shell") ||
+    toolName.includes("terminal") ||
+    toolName.includes("exec") ||
+    toolName.includes("run")
+  ) {
+    return "terminal";
+  }
+  if (
+    toolName.includes("search") ||
+    toolName.includes("grep") ||
+    toolName.includes("web") ||
+    toolName.includes("crawl")
+  ) {
+    return "search";
+  }
+  if (messageType === "tool_call" || messageType === "tool_result") {
+    return "tool";
+  }
+  return "tool";
+}
+
+function resolveStepTitle(tool: CHAT.Task, kind: ProcessStepKind): {
+  title: string;
+  detail?: string;
+} {
+  if (kind === "thinking") {
+    return { title: "深度思考" };
+  }
+
+  if (kind === "assistant_reply") {
+    const text = resolveAssistantReplyText(tool);
+    return {
+      title: "助手回复",
+      detail: text ? (text.length > 48 ? `${text.slice(0, 45)}…` : text) : undefined,
+    };
+  }
+
+  if (kind === "user_message") {
+    const text = resolveUserBriefText(tool);
+    return {
+      title: "给用户的消息",
+      detail: text ? (text.length > 48 ? `${text.slice(0, 45)}…` : text) : undefined,
+    };
+  }
+
+  if (isSubAgentParentTask(tool)) {
+    const sub = resolveSubAgentDisplay(tool);
+    return {
+      title: sub.status === "running" ? "派发子智能体" : "子智能体",
+      detail: sub.description || sub.subagentType,
+    };
+  }
+
+  const action = buildAction(tool);
+  const title = asText(action.action) || "调用工具";
+  const detail = asText(action.name) || asText(action.tool) || undefined;
+
+  // Cursor 风格：动词 + 目标更短
+  if (kind === "read" && detail) {
+    return {
+      title: `读取 ${detail}`,
+      detail: undefined
+    };
+  }
+  if (kind === "edit" && detail) {
+    return {
+      title: `编辑 ${detail}`,
+      detail: undefined
+    };
+  }
+  if (kind === "file" && detail) {
+    const command = asText(tool.resultMap?.command);
+    if (command) {
+      return {
+        title: `${command} ${detail}`,
+        detail: undefined
+      };
+    }
+    return {
+      title: detail,
+      detail: undefined
+    };
+  }
+
+  return {
+    title,
+    detail
+  };
+}
+
+type TimeInterval = {
+  startedAtMs: number;
+  finishedAtMs: number;
+};
+
+type TimingRecord = Record<string, unknown>;
+
+function asRecord(value: unknown): TimingRecord | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as TimingRecord)
+    : undefined;
+}
+
+function resolveDurationMs(value: unknown): number | undefined {
+  if (value == null || (typeof value === "string" && !value.trim())) {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
+function firstDurationMs(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const durationMs = resolveDurationMs(value);
+    if (durationMs != null) {
+      return durationMs;
+    }
+  }
+  return undefined;
+}
+
+function firstTimestampMs(
+  source: TimingRecord | undefined,
+  ...keys: string[]
+): number | undefined {
+  if (!source) {
+    return undefined;
+  }
+  for (const key of keys) {
+    if (!(key in source)) {
+      continue;
+    }
+    const timestampMs = parseMessageTimeMs(source[key]);
+    if (timestampMs != null) {
+      return timestampMs;
+    }
+  }
+  return undefined;
+}
+
+function resolveTaskRecordParts(tool: CHAT.Task): {
+  task: TimingRecord;
+  timing?: TimingRecord;
+  resultMap?: TimingRecord;
+  nestedResultMap?: TimingRecord;
+} {
+  const task = tool as unknown as TimingRecord;
+  const timing = asRecord(task.timing);
+  const resultMap = asRecord(task.resultMap);
+  const nestedResultMap = asRecord(resultMap?.resultMap);
+  return { task, timing, resultMap, nestedResultMap };
+}
+
+function resolveTimingDurationMs(tool: CHAT.Task): number | undefined {
+  const { timing } = resolveTaskRecordParts(tool);
+  return firstDurationMs(timing?.durationMs);
+}
+
+/**
+ * 事件 resultMap 在实时路径会被展开到 task 顶层，在历史路径通常仍嵌在
+ * resultMap 中；两种形态都属于同一层级，必须保持相同优先级。
+ */
+function resolveResultMapDurationMs(tool: CHAT.Task): number | undefined {
+  const { task, resultMap, nestedResultMap } = resolveTaskRecordParts(tool);
+  return firstDurationMs(
+    resultMap?.durationMs,
+    resultMap?.duration_ms,
+    nestedResultMap?.durationMs,
+    nestedResultMap?.duration_ms,
+    task.durationMs,
+    task.duration_ms
+  );
+}
+
+function resolveLegacyDurationMs(tool: CHAT.Task): number | undefined {
+  const { task, resultMap, nestedResultMap } = resolveTaskRecordParts(tool);
+  return firstDurationMs(
+    task.elapsedMs,
+    task.subAgentElapsedMs,
+    resultMap?.elapsedMs,
+    resultMap?.subAgentElapsedMs,
+    nestedResultMap?.elapsedMs,
+    nestedResultMap?.subAgentElapsedMs
+  );
+}
+
+function resolveSubAgentDurationMs(tool: CHAT.Task): number | undefined {
+  if (!isSubAgentParentTask(tool)) {
+    return undefined;
+  }
+  return resolveDurationMs(resolveSubAgentDisplay(tool).totalDurationMs);
+}
+
+function durationFromInterval(interval?: TimeInterval): number | undefined {
+  if (!interval) {
+    return undefined;
+  }
+  return Math.max(interval.finishedAtMs - interval.startedAtMs, 0);
+}
+
+function resolveExplicitInterval(tool: CHAT.Task): TimeInterval | undefined {
+  const { task, timing, resultMap, nestedResultMap } = resolveTaskRecordParts(tool);
+  const sources = [timing, task, resultMap, nestedResultMap];
+
+  for (const source of sources) {
+    if (!source) {
+      continue;
+    }
+    const startedAtMs = firstTimestampMs(source, "startedAt", "started_at");
+    const finishedAtMs = firstTimestampMs(source, "finishedAt", "finished_at");
+
+    if (startedAtMs != null && finishedAtMs != null && finishedAtMs >= startedAtMs) {
+      return { startedAtMs, finishedAtMs };
+    }
+  }
+
+  return undefined;
+}
+
+function resolveTaskStartedAtMs(tool: CHAT.Task): number | undefined {
+  const explicitInterval = resolveExplicitInterval(tool);
+  if (explicitInterval) {
+    return explicitInterval.startedAtMs;
+  }
+
+  const { task, timing, resultMap, nestedResultMap } = resolveTaskRecordParts(tool);
+  return (
+    firstTimestampMs(timing, "startedAt", "started_at") ??
+    firstTimestampMs(task, "startedAt", "started_at") ??
+    firstTimestampMs(resultMap, "startedAt", "started_at") ??
+    firstTimestampMs(nestedResultMap, "startedAt", "started_at") ??
+    firstTimestampMs(task, "messageTime") ??
+    firstTimestampMs(resultMap, "messageTime") ??
+    firstTimestampMs(nestedResultMap, "messageTime")
+  );
+}
+
+function resolveTaskInterval(
+  tool: CHAT.Task,
+  options: { loading: boolean; nowMs: number }
+): TimeInterval | undefined {
+  const explicitInterval = resolveExplicitInterval(tool);
+  if (explicitInterval) {
+    return explicitInterval;
+  }
+
+  const startedAtMs = resolveTaskStartedAtMs(tool);
+  if (
+    options.loading &&
+    startedAtMs != null &&
+    (isTimelineToolActive(tool) || !isStepCompleted(tool))
+  ) {
+    return {
+      startedAtMs,
+      finishedAtMs: Math.max(options.nowMs, startedAtMs),
+    };
+  }
+
+  return undefined;
+}
+
+function resolveSingleToolDuration(
+  step: { tool: CHAT.Task; startedAtMs?: number },
+  nextStartedAtMs: number | undefined,
+  options: { loading: boolean; nowMs: number }
+): number | undefined {
+  // 新回放 timing 是最可信的单 invocation 事实。
+  const timingDurationMs = resolveTimingDurationMs(step.tool);
+  if (timingDurationMs != null) {
+    return timingDurationMs;
+  }
+
+  const resultMapDurationMs = resolveResultMapDurationMs(step.tool);
+  if (resultMapDurationMs != null) {
+    return resultMapDurationMs;
+  }
+
+  const subAgentDurationMs = resolveSubAgentDurationMs(step.tool);
+  if (subAgentDurationMs != null) {
+    return subAgentDurationMs;
+  }
+
+  const explicitIntervalDurationMs = durationFromInterval(
+    resolveExplicitInterval(step.tool)
+  );
+  if (explicitIntervalDurationMs != null) {
+    return explicitIntervalDurationMs;
+  }
+
+  const legacyDurationMs = resolveLegacyDurationMs(step.tool);
+  if (legacyDurationMs != null) {
+    return legacyDurationMs;
+  }
+
+  // 旧实时事件只有 messageTime 时，只能用下一个明确事件时间作为保守边界。
+  // 整轮 finishedAt 不在这里使用，避免把 run 尾部伪装成工具耗时。
+  if (
+    step.startedAtMs != null &&
+    nextStartedAtMs != null &&
+    nextStartedAtMs >= step.startedAtMs
+  ) {
+    return nextStartedAtMs - step.startedAtMs;
+  }
+
+  if (
+    options.loading &&
+    step.startedAtMs != null &&
+    (isTimelineToolActive(step.tool) || !isStepCompleted(step.tool))
+  ) {
+    return Math.max(options.nowMs - step.startedAtMs, 0);
+  }
+
+  return undefined;
+}
+
+function mergeIntervals(intervals: TimeInterval[]): number | undefined {
+  if (!intervals.length) {
+    return undefined;
+  }
+
+  const sorted = [...intervals].sort(
+    (left, right) => left.startedAtMs - right.startedAtMs
+  );
+  let totalMs = 0;
+  let current = sorted[0];
+
+  for (const interval of sorted.slice(1)) {
+    if (interval.startedAtMs <= current.finishedAtMs) {
+      current = {
+        startedAtMs: current.startedAtMs,
+        finishedAtMs: Math.max(current.finishedAtMs, interval.finishedAtMs),
+      };
+      continue;
+    }
+    totalMs += Math.max(current.finishedAtMs - current.startedAtMs, 0);
+    current = interval;
+  }
+
+  return totalMs + Math.max(current.finishedAtMs - current.startedAtMs, 0);
+}
+
+function resolveGroupDurationMs(
+  steps: ProcessStepRow[],
+  options: { loading: boolean; nowMs: number }
+): number | undefined {
+  const intervals = steps
+    .map((step) => resolveTaskInterval(step.tool, options))
+    .filter((interval): interval is TimeInterval => interval != null);
+  return mergeIntervals(intervals);
+}
+
+function estimateDurations(
+  steps: Array<{ tool: CHAT.Task; startedAtMs?: number }>,
+  options: { loading: boolean; nowMs: number }
+): Array<number | undefined> {
+  return steps.map((step, index) =>
+    resolveSingleToolDuration(
+      step,
+      steps.slice(index + 1).find((next) => next.startedAtMs != null)?.startedAtMs,
+      options
+    )
+  );
+}
+
+function flattenGroupChildren(container: CHAT.Task): CHAT.Task[] {
+  return Array.isArray(container.children)
+    ? container.children.filter((task) => !isFileListOnlyTask(task))
+    : [];
+}
+
+function buildStepRows(
+  tools: CHAT.Task[],
+  options: {
+    loading: boolean;
+    nowMs: number;
+  }
+): ProcessStepRow[] {
+  const prepared = tools.map((tool, index) => ({
+    tool,
+    startedAtMs: resolveTaskStartedAtMs(tool),
+    index,
+  }));
+  const durations = estimateDurations(prepared, options);
+
+  return prepared.map((item, index) => {
+    const kind = resolveProcessStepKind(item.tool);
+    const { title, detail } = resolveStepTitle(item.tool, kind);
+    // 整轮结束后禁止残留 active，否则深度思考/步骤会一直 shimmer
+    const active = options.loading && isTimelineToolActive(item.tool);
+    const completed =
+      !active && (isStepCompleted(item.tool) || !options.loading);
+    const durationMs = durations[index];
+    const expandable =
+      kind === "thinking" ||
+      kind === "assistant_reply" ||
+      kind === "interactive" ||
+      kind === "user_message" ||
+      kind === "agent" ||
+      kind === "artifact" ||
+      item.tool.messageType === "deep_search" ||
+      item.tool.messageType === "browser" ||
+      Boolean(item.tool.children?.length);
+
+    return {
+      id: resolveStepId(item.tool, index),
+      kind,
+      title,
+      detail,
+      expandable,
+      active,
+      completed,
+      durationMs,
+      durationLabel: formatProcessDuration(durationMs),
+      tool: item.tool,
+      startedAtMs: item.startedAtMs,
+    };
+  });
+}
+
+function resolveDigitalEmployee(container: CHAT.Task): string | undefined {
+  return container.children?.find((child) => child.digitalEmployee)?.digitalEmployee;
+}
+
+function buildGroupTitle(
+  container: CHAT.Task | undefined,
+  stepCount: number,
+  isPlanSolve: boolean,
+  active: boolean
+): string {
+  if (isPlanSolve && container?.task?.trim()) {
+    return container.task.trim();
+  }
+  if (active) {
+    return stepCount > 0 ? `正在执行 · ${stepCount} 个步骤` : "正在执行";
+  }
+  return `执行了 ${stepCount} 个步骤`;
+}
+
+/**
+ * 分段规则（对齐产品截图）：
+ * - 非空 assistant_reply → 先吐出缓冲中的「深度思考」为外层块，再冲刷工具组，再常显回复（切开）
+ * - 空 assistant_reply → 不切开、不展示
+ * - thinking 无后续非空回复时 → 融入「执行了 N 步」组内作为一步
+ * - user_brief → 常显并切开
+ * - 末尾仅非空过程文且无 tool → final_reply
+ */
+export function segmentProcessSteps(
+  steps: ProcessStepRow[],
+  options: {
+    loading: boolean;
+    isPlanSolve: boolean;
+    container?: CHAT.Task;
+    groupIndexBase?: number;
+    nowMs?: number;
+  }
+): ProcessSegment[] {
+  // 这里把后端任务事件转换成 UI 语义：思考和工具先进入缓冲区，助手过程回复、
+  // user_brief 会切开缓冲区，真实工具才形成可折叠步骤组。切分规则必须与
+  // Timeline 的展示语义一致，否则同一批事件会在实时流和历史回放中呈现不同结构。
+  const segments: ProcessSegment[] = [];
+  /** 缓冲：thinking + tools；有非空助手回复时 thinking 提出外层，否则 thinking 进组 */
+  let buffer: ProcessStepRow[] = [];
+  let groupSerial = options.groupIndexBase ?? 0;
+
+  const isThinkingStep = (step: ProcessStepRow) =>
+    step.kind === "thinking" || isNativeReasoningTask(step.tool);
+
+  const emitStandaloneThinking = (items: ProcessStepRow[]) => {
+    for (const step of items) {
+      if (isThinkingStep(step)) {
+        segments.push({ type: "thinking", step });
+      }
+    }
+  };
+
+  const flushWorkGroup = (forceActive?: boolean) => {
+    if (!buffer.length) {
+      return;
+    }
+    const executables = buffer.filter((step) => countsAsExecutableStep(step.tool));
+    const thinkings = buffer.filter((step) => isThinkingStep(step));
+
+    // 无真实工具：仅深度思考 → 外层折叠块（不当空组）
+    if (!executables.length) {
+      emitStandaloneThinking(thinkings);
+      buffer = [];
+      return;
+    }
+
+    // 有工具：thinking 与 tools 按原序进组（助手为空时深度思考是步骤之一）
+    const ordered = buffer.filter(
+      (step) => countsAsExecutableStep(step.tool) || isThinkingStep(step)
+    );
+    const displayCount = executables.length;
+    // 仅按组内步骤是否仍在执行判定 active，避免整轮 loading 期间步骤组无法折叠
+    const active =
+      Boolean(forceActive) || ordered.some((step) => step.active);
+    const completed = ordered.every((step) => step.completed) && !active;
+    const durationMs = resolveGroupDurationMs(ordered, {
+      loading: options.loading,
+      nowMs: options.nowMs ?? Date.now(),
+    });
+    groupSerial += 1;
+    segments.push({
+      type: "group",
+      group: {
+        id: `${options.container?.id || options.container?.messageId || "work-group"}:${groupSerial}`,
+        title: buildGroupTitle(
+          options.container,
+          displayCount,
+          options.isPlanSolve,
+          active
+        ),
+        taskLabel: options.container?.task,
+        digitalEmployee: options.container
+          ? resolveDigitalEmployee(options.container)
+          : undefined,
+        stepCount: displayCount,
+        active,
+        completed,
+        collapsible: true,
+        durationMs,
+        durationLabel: formatProcessDuration(durationMs),
+        steps: ordered,
+        container: options.container,
+      },
+    });
+    buffer = [];
+  };
+
+  /**
+   * 非空助手回复前的切开：
+   * 1) 缓冲里先出现的 thinking 提出为外层「深度思考」
+   * 2) 剩余 tools（及夹在中间的 thinking）冲成步骤组
+   */
+  const flushBeforeAssistantReply = () => {
+    if (!buffer.length) {
+      return;
+    }
+    // 前缀连续 thinking → 外层
+    const prefixThinking: ProcessStepRow[] = [];
+    let i = 0;
+    while (i < buffer.length && isThinkingStep(buffer[i])) {
+      prefixThinking.push(buffer[i]);
+      i += 1;
+    }
+    const rest = buffer.slice(i);
+    buffer = [];
+    emitStandaloneThinking(prefixThinking);
+    buffer = rest;
+    flushWorkGroup(false);
+  };
+
+  for (const step of steps) {
+    // 1) 深度思考：先进缓冲（是否外提取决于后续有无非空助手回复）
+    if (isThinkingStep(step)) {
+      buffer.push(step);
+      continue;
+    }
+
+    // 2) 助手过程回复
+    if (step.kind === "assistant_reply" || isAssistantProcessReplyTask(step.tool)) {
+      const text = resolveAssistantReplyText(step.tool);
+      // 空回复：不切开、不展示
+      if (!text) {
+        continue;
+      }
+      flushBeforeAssistantReply();
+      segments.push({ type: "assistant_reply", step, text });
+      continue;
+    }
+
+    // 3) user_brief：切开并独立展示
+    if (step.kind === "user_message" || isUserBriefTask(step.tool)) {
+      flushWorkGroup(false);
+      segments.push({ type: "user_message", step });
+      continue;
+    }
+
+    // 3.5) 富交互步骤（AskUserQuestion / ExitPlanMode / 桌面控制）：**先切开前面的工具组**。
+    // 它本身不是一个「可折叠步骤」，若与普通工具一起进 buffer，前面那个写入工具就会被
+    // 并进同一组，在视觉上被提问卡吞掉（用户看到的就是「AskUser 前面的 Write 不见了」）。
+    // 切开后它单独成组，组内只有它（必要时带相邻思考）。
+    if (step.kind === "interactive") {
+      flushWorkGroup(false);
+      buffer.push(step);
+      continue;
+    }
+
+    // 4) 真实工具
+    buffer.push(step);
+  }
+
+  // 末组是否 active 由组内步骤状态决定，不因整轮 loading 强制保持展开
+  flushWorkGroup(false);
+
+  // 终答只走 chat.conclusion / result，不再把过程文提升为 final_reply（避免与结论重复）
+  return segments;
+}
+
+function extractIntentLine(thoughtText?: string, tip?: string): string | undefined {
+  const tipText = asText(tip);
+  if (tipText && !/正在|加载|排队|请稍候|思考中/i.test(tipText)) {
+    // tip 往往是系统状态，不当作意图句
+  }
+  const thought = asText(thoughtText);
+  if (!thought) {
+    return undefined;
+  }
+  const firstLine = thought
+    .split(/\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstLine) {
+    return undefined;
+  }
+  // 过长时截断为意图句
+  if (firstLine.length <= 80) {
+    return firstLine;
+  }
+  return `${firstLine.slice(0, 77)}…`;
+}
+
+function resolveRunDurationMs(
+  chat: CHAT.ChatItem,
+  startedAtMs: number | undefined,
+  nowMs: number
+): number | undefined {
+  const recordedDurationMs = resolveDurationMs(chat.runDurationMs);
+  if (recordedDurationMs != null) {
+    return recordedDurationMs;
+  }
+
+  const runFinishedAtMs = parseMessageTimeMs(chat.finishedAt);
+  if (
+    startedAtMs != null &&
+    runFinishedAtMs != null &&
+    runFinishedAtMs >= startedAtMs
+  ) {
+    return runFinishedAtMs - startedAtMs;
+  }
+
+  if (chat.loading && startedAtMs != null) {
+    return Math.max(nowMs - startedAtMs, 0);
+  }
+
+  return undefined;
+}
+
+export type DeriveAgentProcessModelInput = {
+  chat: CHAT.ChatItem;
+  isPlanSolve: boolean;
+  thoughtText?: string;
+  thoughtStreaming?: boolean;
+  thoughtVersionLabel?: string;
+  thoughtVersionIndex?: number;
+  thoughtVersionTotal?: number;
+  nowMs?: number;
+};
+
+/**
+ * 把现有 chat.tasks / thought 投影为 Cursor 风格过程叙事模型。
+ * 不改 SSE / ledger，只做展示层派生。
+ *
+ * 规则：
+ * 1. SendUserMessage(user_brief) 永不折叠，并切开前后「执行了 N 步」
+ * 2. 终答只走 chat.conclusion；过程文/CoT 不提升为 final_reply
+ */
+export function deriveAgentProcessModel(
+  input: DeriveAgentProcessModelInput
+): AgentProcessModel {
+  const {
+    chat,
+    isPlanSolve,
+    thoughtText = "",
+    thoughtStreaming = false,
+    thoughtVersionLabel,
+    thoughtVersionIndex = 0,
+    thoughtVersionTotal = 0,
+    nowMs = Date.now(),
+  } = input;
+
+  const loading = Boolean(chat.loading);
+  const finishedAtMs =
+    parseMessageTimeMs(chat.finishedAt) ??
+    (loading ? undefined : nowMs);
+  const startedAtMs = parseMessageTimeMs(chat.startedAt);
+
+  // PlanSolve 的 task 容器承载计划步骤，必须保留容器边界；普通 ReAct 历史数据
+  // 可能被按“一个工具一个容器”保存，先合并 children 再分组，才能恢复连续执行组。
+  // 这是展示层的重建，不会改写原始 chat.tasks，也不改变 ledger 的事件顺序。
+  const segments: ProcessSegment[] = [];
+  let groupSerial = 0;
+  const taskGroups = chat.tasks || [];
+
+  // ReAct / 普通任务：跨 container 合并 children 再切分，避免历史回放「一工具一组」时
+  // 永远落成 stepCount=1 的已完成组而被时间线压成平铺（折叠「执行了 N 步」消失）。
+  // PlanSolve 仍按 plan task 容器边界分段，保留步骤标题。
+  type ContainerSlice = {
+    children: CHAT.Task[];
+    container?: CHAT.Task;
+    groupIndex: number;
+    containerIndex: number;
+    isLastContainer: boolean;
+  };
+  const slices: ContainerSlice[] = [];
+
+  if (!isPlanSolve) {
+    const merged: CHAT.Task[] = [];
+    let lastMeta: Omit<ContainerSlice, "children"> | undefined;
+    taskGroups.forEach((group, groupIndex) => {
+      (group || []).forEach((container, containerIndex) => {
+        const children = flattenGroupChildren(container);
+        if (!children.length) {
+          return;
+        }
+        merged.push(...children);
+        lastMeta = {
+          container,
+          groupIndex,
+          containerIndex,
+          isLastContainer:
+            groupIndex === taskGroups.length - 1 &&
+            containerIndex === (group || []).length - 1,
+        };
+      });
+    });
+    if (merged.length && lastMeta) {
+      slices.push({ children: merged, ...lastMeta });
+    }
+  } else {
+    taskGroups.forEach((group, groupIndex) => {
+      (group || []).forEach((container, containerIndex) => {
+        const children = flattenGroupChildren(container);
+        if (!children.length) {
+          return;
+        }
+        slices.push({
+          children,
+          container,
+          groupIndex,
+          containerIndex,
+          isLastContainer:
+            groupIndex === taskGroups.length - 1 &&
+            containerIndex === (group || []).length - 1,
+        });
+      });
+    });
+  }
+
+  for (const slice of slices) {
+    const steps = buildStepRows(slice.children, {
+      loading,
+      nowMs,
+    });
+    if (!steps.length) {
+      continue;
+    }
+
+    const sliced = segmentProcessSteps(steps, {
+      loading: loading && slice.isLastContainer,
+      isPlanSolve,
+      container: slice.container,
+      groupIndexBase: groupSerial,
+      nowMs,
+    });
+    for (const segment of sliced) {
+      if (segment.type === "group") {
+        groupSerial += 1;
+        segment.group.id = `${
+          slice.container?.id ||
+          slice.container?.messageId ||
+          slice.container?.taskId ||
+          "group"
+        }:${slice.groupIndex}:${slice.containerIndex}:${groupSerial}`;
+      }
+      segments.push(segment);
+    }
+  }
+
+  const groups = segments
+    .filter((segment): segment is Extract<ProcessSegment, { type: "group" }> =>
+      segment.type === "group"
+    )
+    .map((segment) => segment.group);
+
+  const finalReplySegment = [...segments]
+    .reverse()
+    .find((segment) => segment.type === "final_reply") as
+    | Extract<ProcessSegment, { type: "final_reply" }>
+    | undefined;
+
+  const totalStepCount = groups.reduce((sum, group) => sum + group.stepCount, 0);
+
+  const thought = asText(thoughtText)
+    ? {
+      text: thoughtText,
+      streaming: Boolean(thoughtStreaming),
+      durationMs: undefined as number | undefined,
+      durationLabel: undefined as string | undefined,
+      versionLabel: thoughtVersionLabel,
+      versionIndex: thoughtVersionIndex,
+      versionTotal: thoughtVersionTotal,
+    }
+    : undefined;
+
+  // 思考块耗时：优先用 startedAt → 首个工具 / finishedAt
+  if (thought) {
+    const firstStepStart = segments
+      .flatMap((segment) => {
+        if (segment.type === "group") {
+          return segment.group.steps;
+        }
+        if (
+          segment.type === "user_message" ||
+          segment.type === "final_reply" ||
+          segment.type === "thinking" ||
+          segment.type === "assistant_reply"
+        ) {
+          return [segment.step];
+        }
+        return [];
+      })
+      .map((step) => step.startedAtMs)
+      .find((value) => value != null);
+    if (thought.streaming && startedAtMs != null) {
+      thought.durationMs = Math.max(nowMs - startedAtMs, 0);
+    } else if (startedAtMs != null && firstStepStart != null && firstStepStart >= startedAtMs) {
+      thought.durationMs = firstStepStart - startedAtMs;
+    } else if (startedAtMs != null && finishedAtMs != null) {
+      thought.durationMs = Math.max(finishedAtMs - startedAtMs, 0);
+    }
+    thought.durationLabel = formatProcessDuration(thought.durationMs);
+  }
+
+  const totalDurationMs = resolveRunDurationMs(chat, startedAtMs, nowMs);
+
+  const intentLine = extractIntentLine(thoughtText, chat.tip);
+
+  return {
+    hasProcess: Boolean(thought || segments.length),
+    loading,
+    thought,
+    intentLine,
+    segments,
+    groups,
+    finalReply: finalReplySegment
+      ? {
+        text: finalReplySegment.text,
+        step: finalReplySegment.step,
+      }
+      : undefined,
+    totalStepCount,
+    totalDurationMs,
+    totalDurationLabel: formatProcessDuration(totalDurationMs),
+  };
+}

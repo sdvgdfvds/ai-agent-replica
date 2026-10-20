@@ -1,0 +1,110 @@
+package org.wwz.ai.application.agent.run;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Service;
+import org.wwz.ai.domain.agent.adapter.port.AgentMessageStream;
+import org.wwz.ai.domain.agent.ledger.ExecutionLedgerRunSupport;
+import org.wwz.ai.domain.agent.ledger.model.ExecutionLedgerConstants;
+import org.wwz.ai.domain.agent.runtime.agent.AgentContext;
+import org.wwz.ai.domain.agent.runtime.cancel.ActiveAgentRunRegistry;
+import org.wwz.ai.domain.agent.runtime.cancel.RunCancellation;
+import org.wwz.ai.domain.agent.runtime.printer.Printer;
+import org.wwz.ai.domain.agent.runtime.tasklist.SessionBackgroundTaskHub;
+import org.wwz.ai.domain.agent.runtime.tasklist.StreamSettlePolicy;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * 用户主动停止本轮 Agent run（协作式取消）。
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class AgentRunStopApplicationService {
+
+    private final ActiveAgentRunRegistry activeAgentRunRegistry;
+    private final AgentRunLaunchGate agentRunLaunchGate;
+
+    public Map<String, Object> stop(String sessionId, String requestId) {
+        // 停止先置取消令牌（在途模型请求会立刻 dispose / cancel），再写 stopped ledger。
+        // launch 尚未开始时直接摘掉注册；已经启动则保留令牌，等 bindContext 把同一令牌注入 context。
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("requestId", requestId);
+        result.put("sessionId", sessionId);
+
+        if (StringUtils.isBlank(requestId)) {
+            result.put("stopped", false);
+            result.put("message", "requestId 不能为空");
+            return result;
+        }
+
+        Optional<ActiveAgentRunRegistry.ActiveRun> found = activeAgentRunRegistry.find(requestId);
+        if (found.isEmpty()) {
+            result.put("stopped", false);
+            result.put("message", "未找到进行中的 run（可能已结束）");
+            return result;
+        }
+
+        ActiveAgentRunRegistry.ActiveRun run = found.get();
+        if (StringUtils.isNotBlank(sessionId)
+                && StringUtils.isNotBlank(run.getSessionId())
+                && !sessionId.equals(run.getSessionId())) {
+            result.put("stopped", false);
+            result.put("message", "sessionId 与 run 不匹配");
+            return result;
+        }
+
+        boolean first = activeAgentRunRegistry.cancel(requestId, RunCancellation.REASON_USER_STOP);
+        boolean launchStillPending = agentRunLaunchGate.cancel(requestId);
+        AgentContext ctx = run.getAgentContext();
+        if (ctx == null && launchStillPending) {
+            activeAgentRunRegistry.end(requestId);
+        }
+        if (ctx != null) {
+            // finishRun 只记录一次用户停止事实，Printer 通知是即时 UI 反馈，两者职责不同，
+            // 不能用关闭 SSE 代替 ledger 状态迁移。
+            ExecutionLedgerRunSupport.finishRun(
+                    ctx,
+                    ExecutionLedgerConstants.STATUS_STOPPED,
+                    null,
+                    "USER_STOP",
+                    "用户停止本轮对话");
+            notifyStopped(ctx);
+        }
+
+        AgentMessageStream stream = run.getStream();
+        // 对齐 ZCode「账本权威、流可断」（默认）：停止即关流，后台子 Agent 终态只落账本；
+        // deferBackgroundSettle=true 时保持旧行为：后台在飞则留着流等 stream_settle。
+        boolean backgroundRunning = StreamSettlePolicy.deferBackgroundSettle()
+                && SessionBackgroundTaskHub.hasRunning(
+                        SessionBackgroundTaskHub.keyFor(run.getSessionId(), requestId));
+        if (stream != null && !backgroundRunning) {
+            try {
+                stream.complete();
+            } catch (Exception e) {
+                log.warn("complete stream after stop failed, requestId={}", requestId, e);
+            }
+        }
+
+        result.put("stopped", true);
+        result.put("firstCancel", first);
+        result.put("message", first ? "已请求停止" : "run 已在停止中");
+        return result;
+    }
+
+    private void notifyStopped(AgentContext ctx) {
+        Printer printer = ctx.getPrinter();
+        if (printer == null) {
+            return;
+        }
+        try {
+            printer.send("result", "已停止。你可以继续发送新消息。");
+        } catch (Exception e) {
+            log.debug("send stop result skipped, requestId={}", ctx.getRequestId());
+        }
+    }
+}

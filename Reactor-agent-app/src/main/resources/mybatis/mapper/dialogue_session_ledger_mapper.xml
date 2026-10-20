@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.wwz.ai.infrastructure.dao.reactor.IDialogueSessionLedgerDao">
+
+    <resultMap id="DialogueSessionMap" type="org.wwz.ai.domain.agent.ledger.entity.DialogueSession">
+        <id column="id" property="id"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="user_id" property="userId"/>
+        <result column="session_kind" property="sessionKind"/>
+        <result column="parent_session_id" property="parentSessionId"/>
+        <result column="title" property="title"/>
+        <result column="status" property="status"/>
+        <result column="latest_request_id" property="latestRequestId"/>
+        <result column="latest_query_text" property="latestQueryText"/>
+        <result column="latest_summary_text" property="latestSummaryText"/>
+        <result column="run_count" property="runCount"/>
+        <result column="finished_run_count" property="finishedRunCount"/>
+        <result column="failed_run_count" property="failedRunCount"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="last_active_at" property="lastActiveAt"/>
+        <result column="event_seq" property="eventSeq"/>
+        <result column="create_time" property="createTime"/>
+        <result column="update_time" property="updateTime"/>
+        <result column="deleted" property="deleted"/>
+    </resultMap>
+
+    <resultMap id="DialogueSessionViewMap" type="org.wwz.ai.domain.agent.ledger.model.DialogueSessionView">
+        <id column="id" property="id"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="user_id" property="userId"/>
+        <result column="session_kind" property="sessionKind"/>
+        <result column="parent_session_id" property="parentSessionId"/>
+        <result column="title" property="title"/>
+        <result column="status" property="status"/>
+        <result column="latest_request_id" property="latestRequestId"/>
+        <result column="latest_query_text" property="latestQueryText"/>
+        <result column="latest_summary_text" property="latestSummaryText"/>
+        <result column="run_count" property="runCount"/>
+        <result column="finished_run_count" property="finishedRunCount"/>
+        <result column="failed_run_count" property="failedRunCount"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="last_active_at" property="lastActiveAt"/>
+        <result column="create_time" property="createTime"/>
+    </resultMap>
+
+    <sql id="dialogueSessionColumns">
+        id, session_id, user_id, session_kind, parent_session_id, title, status, latest_request_id,
+        latest_query_text, latest_summary_text, run_count, finished_run_count, failed_run_count,
+        started_at, last_active_at, event_seq, create_time, update_time, deleted
+    </sql>
+
+    <sql id="dialogueSessionViewColumns">
+        id, session_id, user_id, session_kind, parent_session_id, title, status, latest_request_id,
+        latest_query_text, latest_summary_text, run_count, finished_run_count, failed_run_count,
+        started_at, last_active_at, create_time
+    </sql>
+
+    <sql id="dialogueSessionHistoryViewColumns">
+        id, session_id, user_id, session_kind, parent_session_id, title, status, latest_request_id,
+        LEFT(latest_query_text, 241) AS latest_query_text,
+        LEFT(latest_summary_text, 241) AS latest_summary_text,
+        run_count, finished_run_count, failed_run_count,
+        started_at, last_active_at, create_time
+    </sql>
+
+    <!-- 侧栏白名单：只有 conversation 进列表。子会话靠 session_kind 隐藏，
+         不用 parent_session_id is null —— 后者会误杀有父但应可见的会话。 -->
+    <sql id="listableSessionKindPredicate">
+        AND session_kind = 'conversation'
+    </sql>
+
+    <!-- session_kind / parent_session_id 只在建行时写入，ON DUPLICATE 段刻意不覆盖：
+         会话身份一旦确定就不该被后续 run 改写，否则子会话可能被父 run 刷回 conversation 漏进侧栏。 -->
+    <insert id="upsertSession" parameterType="org.wwz.ai.domain.agent.ledger.model.DialogueSessionUpsertRecord">
+        INSERT INTO ai_agent_dialogue_session (
+            session_id, user_id, session_kind, parent_session_id, title, status, latest_request_id,
+            latest_query_text, latest_summary_text,
+            run_count, finished_run_count, failed_run_count, started_at, last_active_at,
+            create_time, update_time, deleted
+        ) VALUES (
+            #{sessionId}, #{userId}, IFNULL(#{sessionKind}, 'conversation'), #{parentSessionId},
+            #{title}, #{status}, #{latestRequestId}, #{latestQueryText}, #{latestSummaryText},
+            #{runCount}, #{finishedRunCount}, #{failedRunCount}, #{startedAt}, #{lastActiveAt},
+            NOW(), NOW(), 0
+        )
+        ON DUPLICATE KEY UPDATE
+            user_id = CASE
+                WHEN user_id IS NULL OR user_id = '' THEN VALUES(user_id)
+                ELSE user_id
+            END,
+            title = VALUES(title),
+            status = VALUES(status),
+            latest_request_id = VALUES(latest_request_id),
+            latest_query_text = VALUES(latest_query_text),
+            latest_summary_text = VALUES(latest_summary_text),
+            run_count = VALUES(run_count),
+            finished_run_count = VALUES(finished_run_count),
+            failed_run_count = VALUES(failed_run_count),
+            started_at = VALUES(started_at),
+            last_active_at = VALUES(last_active_at),
+            update_time = NOW()
+    </insert>
+
+    <!-- run 启动：已存在则 run_count 原子 +1，保留 started_at 与 finished/failed 计数，避免读-改-写丢更新 -->
+    <insert id="upsertSessionOnRunStart" parameterType="org.wwz.ai.domain.agent.ledger.model.DialogueSessionUpsertRecord">
+        INSERT INTO ai_agent_dialogue_session (
+            session_id, user_id, session_kind, parent_session_id, title, status, latest_request_id,
+            latest_query_text, latest_summary_text,
+            run_count, finished_run_count, failed_run_count, started_at, last_active_at,
+            create_time, update_time, deleted
+        ) VALUES (
+            #{sessionId}, #{userId}, IFNULL(#{sessionKind}, 'conversation'), #{parentSessionId},
+            #{title}, #{status}, #{latestRequestId}, #{latestQueryText}, #{latestSummaryText},
+            1, 0, 0, #{startedAt}, #{lastActiveAt},
+            NOW(), NOW(), 0
+        )
+        ON DUPLICATE KEY UPDATE
+            user_id = CASE
+                WHEN user_id IS NULL OR user_id = '' THEN VALUES(user_id)
+                ELSE user_id
+            END,
+            title = VALUES(title),
+            status = VALUES(status),
+            latest_request_id = VALUES(latest_request_id),
+            latest_query_text = VALUES(latest_query_text),
+            latest_summary_text = VALUES(latest_summary_text),
+            run_count = run_count + 1,
+            last_active_at = VALUES(last_active_at),
+            update_time = NOW()
+    </insert>
+
+    <!-- run 结束：按终态原子累加计数，调用方只在首次进入终态时下发 delta=1 -->
+    <update id="updateSessionRunFinish">
+        UPDATE ai_agent_dialogue_session
+        SET status = #{status},
+            latest_summary_text = #{latestSummaryText},
+            finished_run_count = finished_run_count + #{finishedDelta},
+            failed_run_count = failed_run_count + #{failedDelta},
+            last_active_at = #{lastActiveAt},
+            update_time = NOW()
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+    </update>
+
+    <select id="queryBySessionId" resultMap="DialogueSessionMap">
+        SELECT <include refid="dialogueSessionColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="querySessionOwnership" resultMap="DialogueSessionMap">
+        <!-- session_kind 一并取回：读取路径（history / stream attach）拿到的实体需要能判类型，
+             否则调用方对身份列只能看到 null。deleted/归属判定的最小集之一列不多。 -->
+        SELECT id, session_id, user_id, session_kind, deleted
+        FROM ai_agent_dialogue_session
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="querySessionView" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="querySessionHistoryView" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionHistoryViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="queryRecentSessions" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE deleted = 0
+        <include refid="listableSessionKindPredicate"/>
+        ORDER BY last_active_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="querySessionViewByUserId" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE session_id = #{sessionId}
+          AND user_id = #{userId}
+          AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="queryRecentSessionsByUserId" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE user_id = #{userId}
+          AND deleted = 0
+        <include refid="listableSessionKindPredicate"/>
+        ORDER BY last_active_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="queryRecentSessionsByUserIdAfter" resultMap="DialogueSessionViewMap">
+        SELECT <include refid="dialogueSessionViewColumns"/>
+        FROM ai_agent_dialogue_session
+        WHERE user_id = #{userId}
+          AND deleted = 0
+        <include refid="listableSessionKindPredicate"/>
+        <if test="afterId != null">
+            <choose>
+                <when test="afterLastActiveAt != null">
+                    AND (
+                        last_active_at &lt; #{afterLastActiveAt}
+                        OR last_active_at IS NULL
+                        OR (last_active_at = #{afterLastActiveAt} AND id &lt; #{afterId})
+                    )
+                </when>
+                <otherwise>
+                    AND last_active_at IS NULL
+                    AND id &lt; #{afterId}
+                </otherwise>
+            </choose>
+        </if>
+        ORDER BY last_active_at DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <update id="bumpEventSeq">
+        UPDATE ai_agent_dialogue_session
+        SET event_seq = GREATEST(IFNULL(event_seq, 0), #{eventSeq}),
+            update_time = NOW()
+        WHERE session_id = #{sessionId}
+          AND deleted = 0
+    </update>
+</mapper>

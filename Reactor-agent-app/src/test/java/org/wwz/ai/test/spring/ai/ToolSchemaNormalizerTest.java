@@ -1,0 +1,234 @@
+package org.wwz.ai.test.spring.ai;
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.TypeReference;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.junit.Assert;
+import org.junit.Test;
+import org.slf4j.LoggerFactory;
+import org.springframework.ai.tool.definition.ToolDefinition;
+import org.wwz.ai.domain.agent.runtime.tool.mcp.model.McpToolInfo;
+import org.wwz.ai.domain.agent.runtime.tool.workspace.WorkspaceGrepTool;
+import org.wwz.ai.domain.agent.runtime.tool.workspace.WorkspaceReadTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.CodeExecutionTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.canvas.GetGenuiGuideTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.canvas.ListUiComponentsTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.DataAggregateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.DataCleanTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.DataMergeTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.DataTransformTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.DataValidateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.dataprep.SqlQueryTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.ChartGeneratorTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.ChecklistGenerateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.DocumentGenerateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.DocumentTemplateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.ExcelGeneratorTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.SlidesGenerateTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.TemplateFillerTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docgen.ThemeDesignerTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.docread.PdfReaderTool;
+import org.wwz.ai.domain.agent.runtime.tool.codemode.CodeModeTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.mcp.ToolCallTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.mcp.ToolDescribeTool;
+import org.wwz.ai.domain.agent.runtime.tool.common.skill.SkillViewTool;
+import org.wwz.ai.infrastructure.mcp.adapter.RegistryBackedToolCallback;
+import org.wwz.ai.domain.agent.runtime.util.ToolSchemaNormalizer;
+import org.wwz.ai.domain.agent.runtime.tool.BaseTool;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 工具 Schema 规范化测试
+ */
+public class ToolSchemaNormalizerTest {
+
+    @Test
+    public void test_normalizeEmptySchemaString() {
+        Map<String, Object> normalized = parseSchema(ToolSchemaNormalizer.normalizeSchema((String) null, "check_login_status"));
+
+        Assert.assertEquals("object", normalized.get("type"));
+        Assert.assertTrue(normalized.get("properties") instanceof Map);
+        Assert.assertTrue(((Map<?, ?>) normalized.get("properties")).isEmpty());
+        Assert.assertTrue(normalized.get("required") instanceof List);
+        Assert.assertTrue(((List<?>) normalized.get("required")).isEmpty());
+    }
+
+    @Test
+    public void test_normalizeObjectSchemaWithMissingPropertiesAndRequired() {
+        Map<String, Object> normalized = parseSchema(ToolSchemaNormalizer.normalizeSchema("{\"type\":\"object\"}", "check_login_status"));
+
+        Assert.assertEquals("object", normalized.get("type"));
+        Assert.assertTrue(normalized.get("properties") instanceof Map);
+        Assert.assertTrue(((Map<?, ?>) normalized.get("properties")).isEmpty());
+        Assert.assertTrue(normalized.get("required") instanceof List);
+        Assert.assertTrue(((List<?>) normalized.get("required")).isEmpty());
+    }
+
+    @Test
+    public void test_normalizeInvalidPropertiesAndRequiredTypes() {
+        Map<String, Object> normalized = parseSchema(ToolSchemaNormalizer.normalizeSchema(
+                "{\"type\":\"object\",\"properties\":\"bad\",\"required\":\"bad\"}",
+                "check_login_status"));
+
+        Assert.assertEquals("object", normalized.get("type"));
+        Assert.assertTrue(normalized.get("properties") instanceof Map);
+        Assert.assertTrue(((Map<?, ?>) normalized.get("properties")).isEmpty());
+        Assert.assertTrue(normalized.get("required") instanceof List);
+        Assert.assertTrue(((List<?>) normalized.get("required")).isEmpty());
+    }
+
+    @Test
+    public void test_keepValidSchemaAndRemoveUnsupportedFields() {
+        Map<String, Object> rawSchema = new LinkedHashMap<>();
+        rawSchema.put("type", "object");
+        rawSchema.put("$schema", "https://json-schema.org/draft/2020-12/schema");
+        rawSchema.put("additionalProperties", false);
+        rawSchema.put("properties", Map.of("query", Map.of("type", "string")));
+        rawSchema.put("required", List.of("query"));
+
+        Map<String, Object> normalized = ToolSchemaNormalizer.normalizeSchema(rawSchema, "deep_search");
+
+        Assert.assertEquals("object", normalized.get("type"));
+        Assert.assertFalse(normalized.containsKey("$schema"));
+        Assert.assertFalse(normalized.containsKey("additionalProperties"));
+        Assert.assertTrue(normalized.get("properties") instanceof Map);
+        Assert.assertEquals("string", ((Map<?, ?>) ((Map<?, ?>) normalized.get("properties")).get("query")).get("type"));
+        Assert.assertEquals(List.of("query"), normalized.get("required"));
+    }
+
+    @Test
+    public void test_registryBackedToolCallbackUsesNormalizedSchema() {
+        McpToolInfo toolInfo = McpToolInfo.builder()
+                .mcpId("mcp-xhs")
+                .name("check_login_status")
+                .desc("检查小红书登录状态")
+                .parameters("{\"type\":\"object\"}")
+                .build();
+
+        RegistryBackedToolCallback callback = new RegistryBackedToolCallback(null, toolInfo);
+        ToolDefinition toolDefinition = callback.getToolDefinition();
+        Map<String, Object> normalized = parseSchema(toolDefinition.inputSchema());
+
+        Assert.assertEquals("object", normalized.get("type"));
+        Assert.assertTrue(normalized.get("properties") instanceof Map);
+        Assert.assertTrue(((Map<?, ?>) normalized.get("properties")).isEmpty());
+        Assert.assertEquals(List.of(), normalized.get("required"));
+    }
+
+    @Test
+    public void test_validSkillToolSchemasShouldNotEmitIncompleteSchemaWarning() {
+        assertNoIncompleteSchemaWarning(
+                new SkillViewTool(null, null, null, null),
+                new WorkspaceReadTool(null, null),
+                new WorkspaceGrepTool(null, null)
+        );
+    }
+
+    @Test
+    public void test_fixedRuntimeToolSchemasShouldNotEmitIncompleteSchemaWarning() {
+        assertNoIncompleteSchemaWarning(
+                new ChartGeneratorTool(),
+                new ChecklistGenerateTool(),
+                new CodeExecutionTool(),
+                new DataAggregateTool(),
+                new DataCleanTool(),
+                new DataMergeTool(),
+                new DataTransformTool(),
+                new DataValidateTool(),
+                new DocumentGenerateTool(),
+                new DocumentTemplateTool(),
+                new ExcelGeneratorTool(),
+                new GetGenuiGuideTool(),
+                new ListUiComponentsTool(),
+                new PdfReaderTool(),
+                new SlidesGenerateTool(),
+                new SqlQueryTool(),
+                new TemplateFillerTool(),
+                new ThemeDesignerTool()
+        );
+    }
+
+    /**
+     * code_mode / ToolCall / ToolDescribe 都含「自由 object」参数（inputs、arguments），
+     * 必须显式声明 properties/required，否则每次装配都会刷不完整 schema 告警。
+     */
+    @Test
+    public void test_codeModeAndDeferredBridgeSchemasShouldNotEmitIncompleteSchemaWarning() {
+        assertNoIncompleteSchemaWarning(
+                new CodeModeTool(null),
+                new ToolCallTool(),
+                new ToolDescribeTool()
+        );
+    }
+
+    @Test
+    public void test_codeModeSchemaDeclaresRequiredAndFreeObjectInputs() {
+        Map<?, ?> schema = new CodeModeTool(null).toParams();
+
+        Assert.assertEquals("object", schema.get("type"));
+        Assert.assertEquals(List.of(), schema.get("required"));
+
+        Map<?, ?> inputs = (Map<?, ?>) ((Map<?, ?>) schema.get("properties")).get("inputs");
+        Assert.assertEquals("object", inputs.get("type"));
+        Assert.assertTrue(inputs.get("properties") instanceof Map);
+        Assert.assertEquals(List.of(), inputs.get("required"));
+    }
+
+    @Test
+    public void test_toolCallArgumentsSchemaIsExplicitObject() {
+        Map<?, ?> schema = new ToolCallTool().toParams();
+
+        Assert.assertEquals(List.of("name", "arguments"), schema.get("required"));
+
+        Map<?, ?> arguments = (Map<?, ?>) ((Map<?, ?>) schema.get("properties")).get("arguments");
+        Assert.assertEquals("object", arguments.get("type"));
+        Assert.assertTrue(arguments.get("properties") instanceof Map);
+        Assert.assertEquals(List.of(), arguments.get("required"));
+    }
+
+    @Test
+    public void test_dataCleanFillMissingSchemaUsesFillValue() {
+        Map<String, Object> schema = new DataCleanTool().toParams();
+        Map<?, ?> operations = (Map<?, ?>) ((Map<?, ?>) schema.get("properties")).get("operations");
+        Map<?, ?> operationItems = (Map<?, ?>) operations.get("items");
+        Map<?, ?> operationProperties = (Map<?, ?>) operationItems.get("properties");
+
+        Assert.assertTrue(operationProperties.containsKey("fill_value"));
+        Assert.assertTrue(operationProperties.containsKey("fill_strategy"));
+        Assert.assertFalse(operationProperties.containsKey("value"));
+        Assert.assertEquals(List.of("type"), operationItems.get("required"));
+    }
+
+    private void assertNoIncompleteSchemaWarning(BaseTool... tools) {
+        Logger logger = (Logger) LoggerFactory.getLogger(ToolSchemaNormalizer.class);
+        ListAppender<ILoggingEvent> listAppender = new ListAppender<>();
+        listAppender.start();
+        logger.addAppender(listAppender);
+
+        try {
+            for (BaseTool tool : tools) {
+                ToolSchemaNormalizer.normalizeSchema(tool.toParams(), tool.getName());
+            }
+
+            List<String> warnings = listAppender.list.stream()
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .filter(message -> message.contains("检测到不完整 object schema"))
+                    .toList();
+
+            Assert.assertTrue("合法 schema 不应该触发不完整 object schema 告警: " + warnings, warnings.isEmpty());
+        } finally {
+            logger.detachAppender(listAppender);
+            listAppender.stop();
+        }
+    }
+
+    private Map<String, Object> parseSchema(String schema) {
+        return JSON.parseObject(schema, new TypeReference<LinkedHashMap<String, Object>>() {
+        });
+    }
+}

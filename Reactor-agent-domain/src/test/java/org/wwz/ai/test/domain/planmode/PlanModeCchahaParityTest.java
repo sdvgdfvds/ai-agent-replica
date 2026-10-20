@@ -1,0 +1,164 @@
+package org.wwz.ai.test.domain.planmode;
+
+import org.junit.Assert;
+import org.junit.Test;
+import org.wwz.ai.domain.agent.runtime.planmode.PendingPlanApproval;
+import org.wwz.ai.domain.agent.runtime.planmode.PendingPlanApprovalRegistry;
+import org.wwz.ai.domain.agent.runtime.planmode.PlanApprovalDecision;
+import org.wwz.ai.domain.agent.runtime.planmode.PlanModePromptInjector;
+import org.wwz.ai.domain.agent.runtime.planmode.PlanModeState;
+import org.wwz.ai.domain.agent.runtime.planmode.PlanModeToolPolicy;
+
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Plan Mode：状态机 + 工具门禁 + 批准挂起。
+ * 不依赖 AgentContext（避开 domain 单测 logback 冲突）。
+ */
+public class PlanModeCchahaParityTest {
+
+    @Test
+    public void planModeInstructionsContainMustNotExecute() {
+        String text = PlanModePromptInjector.PLAN_MODE_INSTRUCTIONS;
+        Assert.assertTrue(text.contains("MUST NOT"));
+        Assert.assertTrue(text.contains("Plan mode is active"));
+        Assert.assertTrue(text.contains(PlanModePromptInjector.PLAN_MODE_INSTRUCTIONS_MARKER));
+    }
+
+    @Test
+    public void exitPendingDoesNotLeavePlanModeUntilApproved() {
+        PlanModeState state = PlanModeState.builder().build();
+        state.enterPlanMode();
+        state.requestExitWithPlan("## Plan\n1. do x", "/tmp/plan.md");
+        Assert.assertTrue(state.isPlanMode());
+        Assert.assertTrue(state.isExitPendingApproval());
+        Assert.assertTrue(state.getPendingPlanContent().contains("do x"));
+
+        String restored = state.exitPlanMode();
+        Assert.assertEquals(PlanModeState.MODE_DEFAULT, restored);
+        Assert.assertFalse(state.isPlanMode());
+        Assert.assertFalse(state.isExitPendingApproval());
+        Assert.assertTrue(state.isHasExitedPlanMode());
+    }
+
+    @Test
+    public void toolPolicyBlocksMutatingToolsInPlanMode() {
+        PlanModeState state = PlanModeState.builder().build();
+        state.enterPlanMode();
+
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "code_interpreter", Map.of()));
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "workspace_write", Map.of("path", "src/Main.java")));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "workspace_write", Map.of("path", ".reactor/plan.md")));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "workspace_read", Map.of("path", "src/Main.java")));
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "host_cli", Map.of()));
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "browser", Map.of()));
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "opencli", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "Agent", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "ExitPlanMode", Map.of()));
+    }
+
+    /**
+     * system 已带契约时，首条提醒必须是 sparse（否则进入 plan 第一步就双份全文）。
+     */
+    @Test
+    public void firstReminderIsSparseWhenSystemAlreadyHasContract() {
+        String systemWithContract = PlanModePromptInjector.ensurePlanModeInstructions("# base");
+        Assert.assertTrue(systemWithContract.contains(PlanModePromptInjector.PLAN_MODE_INSTRUCTIONS_MARKER));
+
+        Assert.assertFalse(PlanModePromptInjector.shouldAttachFull(systemWithContract, 0));
+        Assert.assertFalse(PlanModePromptInjector.shouldAttachFull(systemWithContract, 1));
+        // 每第 5 条提醒仍用全文刷新一次
+        Assert.assertTrue(PlanModePromptInjector.shouldAttachFull(systemWithContract, 5));
+        // system 没有契约（注入失败）时用全文兜底
+        Assert.assertTrue(PlanModePromptInjector.shouldAttachFull("# base", 0));
+        Assert.assertTrue(PlanModePromptInjector.shouldAttachFull(null, 0));
+    }
+
+    /**
+     * plan 期只拦"写"和"有副作用的外部动作"，检索类工具不再被拦（也不再从 tools[] 里剔除）。
+     */
+    @Test
+    public void toolPolicyAllowsSearchToolsInPlanMode() {
+        PlanModeState state = PlanModeState.builder().build();
+        state.enterPlanMode();
+
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "web_search", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "WebSearch", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "deep_search", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "web_fetch", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "session_search", Map.of()));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "skills_search", Map.of()));
+    }
+
+    @Test
+    public void toolPolicyAllowsAllWhenNotInPlanMode() {
+        PlanModeState state = PlanModeState.builder().build();
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "workspace_write", Map.of("path", "a.txt")));
+    }
+
+    @Test
+    public void approvalRegistryApproveWakesFuture() throws Exception {
+        PendingPlanApprovalRegistry registry = new PendingPlanApprovalRegistry();
+        PendingPlanApproval pending = registry.create("sess", "req", "tc1", "## P", null, 5000L);
+
+        CompletableFuture<PlanApprovalDecision> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return registry.awaitDecision(pending);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread.sleep(50);
+        Assert.assertTrue(registry.approve(pending.getApprovalId(), null, null));
+        Assert.assertTrue(registry.get(pending.getApprovalId()).isEmpty());
+        PlanApprovalDecision decision = waiter.get(3, TimeUnit.SECONDS);
+        Assert.assertTrue(decision.isApproved());
+    }
+
+    @Test
+    public void planModeFilterStripsWriteToolsEvenForGeneralPurpose() {
+        // 不构造 ToolCollection（domain 单测 logback 冲突），只验证 disallowed 逻辑入口
+        // 完整 filter 在 app 模块集成测；此处验证 policy + state 组合语义
+        PlanModeState state = PlanModeState.builder().build();
+        state.enterPlanMode();
+        Assert.assertNotNull(PlanModeToolPolicy.denyReason(state, "workspace_write", Map.of("path", "a.java")));
+        Assert.assertNull(PlanModeToolPolicy.denyReason(state, "workspace_read", Map.of("path", "a.java")));
+    }
+
+    @Test
+    public void approvalRegistryRejectWakesFuture() throws Exception {
+        PendingPlanApprovalRegistry registry = new PendingPlanApprovalRegistry();
+        PendingPlanApproval pending = registry.create("sess", "req", "tc1", "## P", null, 5000L);
+
+        CompletableFuture<PlanApprovalDecision> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return registry.awaitDecision(pending);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        Thread.sleep(50);
+        Assert.assertTrue(registry.reject(pending.getApprovalId(), "need more detail"));
+        Assert.assertTrue(registry.get(pending.getApprovalId()).isEmpty());
+        PlanApprovalDecision decision = waiter.get(3, TimeUnit.SECONDS);
+        Assert.assertFalse(decision.isApproved());
+        Assert.assertTrue(decision.getFeedback().contains("more detail"));
+    }
+
+    @Test
+    public void cancelRemovesPendingEntryAndConsumeIsOneShot() {
+        PendingPlanApprovalRegistry registry = new PendingPlanApprovalRegistry();
+        PendingPlanApproval cancelled = registry.create("sess", "req", "tc1", "## P", null, 5000L);
+
+        Assert.assertTrue(registry.cancel(cancelled.getApprovalId(), "stopped"));
+        Assert.assertTrue(registry.get(cancelled.getApprovalId()).isEmpty());
+
+        PendingPlanApproval consumable = registry.create("sess", "req", "tc2", "## P", null, 5000L);
+        Assert.assertTrue(registry.consume(consumable.getApprovalId()).isPresent());
+        Assert.assertTrue(registry.consume(consumable.getApprovalId()).isEmpty());
+    }
+}
